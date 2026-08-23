@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	ratelimit "rate_limit/iternal/rate-limit"
+	"strconv"
 )
 
 type LoginHandler struct {
@@ -19,9 +21,13 @@ func NewLoginHandler(rateService ratelimit.RateLimitInterface) *LoginHandler {
 }
 
 func (l *LoginHandler) Login(w http.ResponseWriter, r *http.Request) {
-	ip := r.RemoteAddr
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		http.Error(w, "invalid remote address", http.StatusInternalServerError)
+		return
+	}
 
-	RateStatus, err := l.RateService.RateLimit(r.Context(), ip)
+	RateStatus, retryAfter, err := l.RateService.RateLimit(r.Context(), ip)
 
 	if RateStatus == ratelimit.RateStatusAllowed {
 		var buf bytes.Buffer
@@ -45,8 +51,7 @@ func (l *LoginHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if RateStatus == ratelimit.RateStatusRetryAfter {
-		status := http.StatusTooManyRequests
-		http.Error(w, err.Error(), status)
-		return
+		w.Header().Set("Retry-After", strconv.FormatInt(max(retryAfter, 1), 10))
+		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 	}
 }

@@ -11,19 +11,30 @@ import (
 var script = redis.NewScript(`
     local count = redis.call("INCR", KEYS[1])
 
-    if count == 1 then
-        redis.call("EXPIRE", KEYS[1], ARGV[1])
-    end
+if count == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
 
-    if count > 5 then
-        return redis.call("TTL", KEYS[1])
-    end
+local ttl = redis.call("TTL", KEYS[1])
 
-    return 1
+if ttl == -1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+    ttl = tonumber(ARGV[1])
+end
+
+if count <= tonumber(ARGV[2]) then
+    return {1, ttl}
+end
+
+return {0, ttl}
 `)
 
 type RateLimitInterface interface {
-	RateLimit(ctx context.Context, ip string) (RateStatus, error)
+	RateLimit(ctx context.Context, ip string) (
+		status RateStatus,
+		retryAfter int64,
+		err error,
+	)
 }
 
 type RateLimitRedisRepository struct {
@@ -45,24 +56,40 @@ const (
 	RateStatusError      RateStatus = "error"
 )
 
-func (r *RateLimitRedisRepository) RateLimit(ctx context.Context, ip string) (RateStatus, error) {
+func (r *RateLimitRedisRepository) RateLimit(ctx context.Context, ip string) (RateStatus, int64, error) {
 	if err := ctx.Err(); err != nil {
-		return RateStatusError, err
+		return RateStatusError, 0, err
 	}
 	window := 60 * time.Second
-	value, err := script.Run(ctx, r.RedisClient, []string{rateKey + ip}, int64(window.Seconds())).Result()
+	values, err := script.Run(
+		ctx,
+		r.RedisClient,
+		[]string{rateKey + ip},
+		int64(window.Seconds()),
+		5,
+	).Slice()
+
 	if err != nil {
-		return RateStatusError, err
+		return RateStatusError, 0, err
 	}
 
-	result, ok := value.(int64)
+	if len(values) != 2 {
+		return RateStatusError, 0, fmt.Errorf("unexpected result length: %d", len(values))
+	}
+
+	allowed, ok := values[0].(int64)
 	if !ok {
-		return RateStatusError, fmt.Errorf("unexpected redis script result type: %T", value)
-	}
-	if result == 1 {
-		return RateStatusAllowed, nil
+		return RateStatusError, 0, fmt.Errorf("unexpected allowed type: %T", values[0])
 	}
 
-	retryAfter := time.Duration(result) * time.Second
-	return RateStatusRetryAfter, fmt.Errorf("Попробуйте снова через: %s", retryAfter)
+	ttl, ok := values[1].(int64)
+	if !ok {
+		return RateStatusError, 0, fmt.Errorf("unexpected TTL type: %T", values[1])
+	}
+
+	if allowed == 1 {
+		return RateStatusAllowed, 0, nil
+	}
+
+	return RateStatusRetryAfter, ttl, nil
 }
